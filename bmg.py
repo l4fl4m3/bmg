@@ -200,14 +200,14 @@ class Agent:
         plt.plot(self.cum_rewards)
         plt.xlabel('Steps')
         plt.ylabel('Cumulative Reward')
-        plt.savefig('cumulative_reward')
+        plt.savefig('res/cumulative_reward')
         plt.close(cr)
 
         er = plt.figure(figsize=(10, 10))
         plt.plot(self.entropy_rate)
         plt.xlabel('Steps')
         plt.ylabel('Entropy Rate')
-        plt.savefig('entropy_rate')
+        plt.savefig('res/entropy_rate')
         plt.close(er)
 
     def run(self):
@@ -252,7 +252,7 @@ class Agent:
 
 if __name__ == "__main__":
     '''Driver code'''
-    steps = 5_000_000
+    steps = 2000
     K_steps = 3
     L_steps = 5
     rollout_steps = 16
