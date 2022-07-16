@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import random
 import os
-import gym
 import TorchOpt
 from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
@@ -91,6 +90,7 @@ class Agent:
         self.actorcritic = ActorCritic(input_dims, n_actions, alpha, fc1_dims = 256, fc2_dims = 256)
         self.ac_k = ActorCritic(input_dims, n_actions, alpha, fc1_dims = 256, fc2_dims = 256)
         self.meta_mlp = MetaMLP(m_alpha, betas, eps, input_dims=10, fc1_dims=32)
+
         self.env = env
         self.name = f"agent_{name}"
         self.n_actions = n_actions
@@ -100,20 +100,19 @@ class Agent:
         self.L_steps = L_steps
         self.rollout_steps = rollout_steps
         self.random_seed = random_seed
-        self.env.set_seed(random_seed)
         self.gamma = gamma
+        
+        self.env.set_seed(random_seed)
 
         #stats
-        self.average_reward = [0 for _ in range(10)]
-        self.reward_history = 0
-        self.r_per_step = []
-        self.cumulative_rewards = []
+        self.avg_reward = [0 for _ in range(10)]
+        self.accum_reward = 0
+        self.cum_rewards = []
         self.entropy_rate = []
 
     def rollout(self, bootstrap=False):
         log_probs, values, rewards, masks, states = [], [], [], [], []
-        rollout_reward = 0
-        entropy = 0
+        rollout_reward, entropy = 0, 0
         obs = self.env.reset()
         done = False
         for _ in range(self.rollout_steps):
@@ -124,7 +123,7 @@ class Agent:
             action = dist.sample()
 
             obs_, reward, done, _ = self.env.step(action.numpy()[0])
-            self.reward_history += reward
+            self.accum_reward += reward
 
             log_prob = dist.log_prob(action)
             entropy += -dist.entropy()
@@ -132,18 +131,16 @@ class Agent:
             states.append(obs)
             log_probs.append(log_prob.unsqueeze(0).to(self.actorcritic.device))
             values.append(v)
-            rewards.append(T.tensor([reward], dtype=T.float).to(self.actorcritic.device))
+            rewards.append(T.tensor(reward, dtype=T.float).to(self.actorcritic.device))
 
-            # non-episodic, set all masks to 1 (i.e use all rewards)
+            # non-episodic, (i.e use all rewards)
             #masks.append(T.tensor([1-int(done)], dtype=T.float).to(self.actorcritic.device))
             #rollout_reward += reward*(1-int(done))
-            masks.append(T.tensor([1], dtype=T.float).to(self.actorcritic.device))
             rollout_reward += reward
+
+            self.cum_rewards.append(self.accum_reward)
             
             obs = obs_
-
-            self.cumulative_rewards.append(self.reward_history)
-            #self.r_per_step.append(self.cumulative_rewards)
 
             # No need, since non-episodic
             '''
@@ -153,135 +150,97 @@ class Agent:
 
         obs_ = T.tensor([obs_], dtype=T.float).to(self.actorcritic.device)
         _, v = self.actorcritic(obs_)
-
+        
         # Calc discounted returns
         R = v
-        adjusted_returns = []
+        discounted_returns = []
         for step in reversed(range(len(rewards))):
-            R = rewards[step] + self.gamma * R * masks[step]
-            adjusted_returns.insert(0, R)
+            #R = rewards[step] + self.gamma * R * masks[step]
+            R = rewards[step] + self.gamma * R
+            discounted_returns.insert(0, R)
 
         log_probs = T.cat(log_probs)
         values    = T.cat(values)
+
+        self.avg_reward = self.avg_reward[1:] 
+        self.avg_reward.append(rollout_reward / self.rollout_steps)
+        ar = T.tensor(self.avg_reward, dtype=T.float).to(self.actorcritic.device)
+        eps_en = self.meta_mlp(ar)
+
         entropy = entropy / self.rollout_steps
-
-        self.average_reward[:-1] = self.average_reward[1:] 
-        self.average_reward[-1] = rollout_reward / self.rollout_steps
-        eps_en = self.meta_mlp(T.tensor(self.average_reward, dtype=T.float).to(self.actorcritic.device))
-
         self.entropy_rate.append(float(eps_en)) 
         
-        returns = T.cat(adjusted_returns).detach()
+        returns = T.cat(discounted_returns).detach()
         advantage = returns - values
 
         # Compute losses
         actor_loss  = -(log_probs * advantage.detach()).mean()
         critic_loss = 0.5 * advantage.pow(2).mean()
 
-        # Terms of policy gradient, temporal difference and entropy 
         if bootstrap:
-            loss = actor_loss
-            return loss, states
+            return actor_loss, states
         else:
-            loss = actor_loss + critic_loss + eps_en * entropy
-            return loss
+            return actor_loss + critic_loss + eps_en * entropy
 
-    def matching_function(self, Kth_model, TB_model, states, Kth_state_dict):
-
-        TorchOpt.recover_state_dict(Kth_model, Kth_state_dict)
-
-        dist_K = [Kth_model(states[i])[0] for i in range(len(states))]
+    def kl_matching_function(self, ac_k, tb, states, ac_k_state_dict):
         with T.no_grad():
-            dist_T = [TB_model(states[i])[0] for i in range(len(states))]
+            dist_tb = [tb(states[i])[0] for i in range(len(states))]
 
-        KL_loss = sum([kl_divergence(dist_T[i], dist_K[i]) for i in range(len(states))])
+        TorchOpt.recover_state_dict(ac_k, ac_k_state_dict)
+        dist_k = [ac_k(states[i])[0] for i in range(len(states))]
+        
+        # KL Div between dsitributions of TB and AC_K, respectively
+        kl_div = sum([kl_divergence(dist_tb[i], dist_k[i]) for i in range(len(states))])
 
-        return KL_loss
+        return kl_div
 
     def plot_results(self):
-        
-        #cr = np.array(self.cumulative_rewards)
-        #rs = np.array(self.r_per_step)
-        #er = np.array(self.entropy_rate)
 
-        fig1 = plt.figure(figsize=(20, 20)) 
-        plt.plot(self.cumulative_rewards)
+        cr = plt.figure(figsize=(10, 10)) 
+        plt.plot(self.cum_rewards)
         plt.xlabel('Steps')
         plt.ylabel('Cumulative Reward')
-        plt.savefig('cumul_reward')
-        plt.close(fig1)
+        plt.savefig('cumulative_reward')
+        plt.close(cr)
 
-        '''
-        fig2 = plt.figure(figsize=(20, 20)) 
-        plt.plot(self.r_per_step, color = "blue")
-        plt.ylim([-0.5, 0.5])
-        plt.xlabel('Steps')
-        plt.ylabel('Reward/Step')
-        plt.savefig('rew_per_step')
-        plt.close(fig2)
-        '''
-
-        fig3 = plt.figure(figsize=(20, 20))
+        er = plt.figure(figsize=(10, 10))
         plt.plot(self.entropy_rate)
         plt.xlabel('Steps')
         plt.ylabel('Entropy Rate')
         plt.savefig('entropy_rate')
-        plt.close(fig3)
+        plt.close(er)
 
     def run(self):
 
-        outer_steps = self.steps // self.rollout_steps // (self.K_steps + self.L_steps)
+        outer_range = self.steps // self.rollout_steps
+        outer_range = outer_range // (self.K_steps + self.L_steps)
 
-        for outer_step in range(outer_steps):
-            for inner_step in range(self.K_steps + self.L_steps):
-                #print(f"outerstep#: {outer_step}")
-                if inner_step == self.K_steps + self.L_steps - 1:
-                    bootstrap_loss, states = self.rollout(bootstrap=True)
-                    self.actorcritic.optim.step(bootstrap_loss)
-                else:
-                    loss = self.rollout()
-                    self.actorcritic.optim.step(loss)
-
-                if inner_step == self.K_steps - 1: 
-                    Kth_state_dict = TorchOpt.extract_state_dict(self.actorcritic)            
-
-                if inner_step == self.K_steps + self.L_steps - 2:
-                    saved_state_dict = TorchOpt.extract_state_dict(self.actorcritic)
-
-            # KL-Div loss
-            KL_loss = self.matching_function(self.ac_k, self.actorcritic, states, Kth_state_dict)
+        for _ in range(outer_range):
+            for _ in range(self.K_steps):
+                loss = self.rollout()
+                self.actorcritic.optim.step(loss)
+            k_state_dict = TorchOpt.extract_state_dict(self.actorcritic)
             
-            # Meta update
+            for _ in range(self.L_steps-1):
+                loss = self.rollout()
+                self.actorcritic.optim.step(loss)
+            k_l_m1_state_dict = TorchOpt.extract_state_dict(self.actorcritic)
+
+            bootstrap_loss, states = self.rollout(bootstrap=True)
+            self.actorcritic.optim.step(bootstrap_loss)
+
+            # KL-Div Matching loss
+            kl_matching_loss = self.kl_matching_function(self.ac_k, self.actorcritic, states, k_state_dict)
+            
+            # MetaMLP update
             self.meta_mlp.optim.zero_grad()
-            KL_loss.backward()
+            kl_matching_loss.backward()
             self.meta_mlp.optim.step()
 
-            # Use most recent params
-            TorchOpt.recover_state_dict(self.actorcritic, saved_state_dict)
+            # Use most recent params and stop grad
+            TorchOpt.recover_state_dict(self.actorcritic, k_l_m1_state_dict)
             TorchOpt.stop_gradient(self.actorcritic)
             TorchOpt.stop_gradient(self.actorcritic.optim)
-
-            '''
-            # test
-            if (outer_step + 1) % 10== 0:
-                test_env = gym.make(env_id)
-                test_env.seed(self.random_seed)
-                score = 0
-                for _ in range(100):
-                    obs = test_env.reset()
-                    for i in range(1000):
-                        action = self.actorcritic.choose_action(obs)
-                        obs_, reward, done, info = test_env.step(action)
-                        score += reward
-                        obs = obs_
-                        if done:
-                            break
-                    #scores.append(score)
-                avg_score = score/100
-                print(f"step: {outer_step+1} avg_100_eps_score: {avg_score} meta_param(entropy): {entropy}")
-                if avg_score > test_env.spec.reward_threshold:
-                    break
-            '''
 
     def save_models(self):
         self.actorcritic.save_checkpoint()
@@ -293,9 +252,9 @@ class Agent:
 
 if __name__ == "__main__":
     '''Driver code'''
-    steps = 200000
-    K_steps = 7
-    L_steps = 9
+    steps = 5_000_000
+    K_steps = 3
+    L_steps = 5
     rollout_steps = 16
     random_seed = 5
     env = TwoColorGridWorld()
@@ -304,8 +263,8 @@ if __name__ == "__main__":
     gamma = 0.99
     alpha = 0.1
     m_alpha = 0.0001
-    betas=(0.9, 0.999)
-    eps=1e-4
+    betas = (0.9, 0.999)
+    eps = 1e-4
     name = 'meta_agent_bmg' 
 
     # set seed

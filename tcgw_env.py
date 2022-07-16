@@ -1,5 +1,5 @@
 import gym, random
-from gym.spaces import Discrete, Box
+from gym.spaces import Discrete
 import numpy as np
 
 class TwoColorGridWorld(gym.Env):
@@ -10,8 +10,8 @@ class TwoColorGridWorld(gym.Env):
         self.action_space = Discrete(4)
 
         self.random_squares = random.sample(range(0, self.size), 3)  # g,b,r == 0,1,2
-        self.rewards = [-0.04, 1, -1]
-        self.flip_threshold = 100000
+        self.rewards = [-0.04, 1, -1] # g,b,r
+        self.threshold = 100_000
         self.step_count = 0
 
         self.observation_space = self.make_space()
@@ -24,8 +24,8 @@ class TwoColorGridWorld(gym.Env):
         obs_space = []
         for c in coordinates:
             one_hot = np.eye(self.l)[c]
-            obs_space = np.append(obs_space, one_hot)
-        return np.array(obs_space)
+            obs_space.append(one_hot)
+        return np.array(obs_space).flatten()
 
     def move_green(self, action):
         #up
@@ -69,8 +69,8 @@ class TwoColorGridWorld(gym.Env):
             reward = self.rewards[0]
             done = False
 
-        if self.step_count == self.flip_threshold: 
-            self.rewards[0], self.rewards[1] = self.rewards[1], self.rewards[0]
+        if self.step_count == self.threshold: 
+            self.rewards[1], self.rewards[2] = self.rewards[2], self.rewards[1]
             self.step_count = 0
 
         return reward, done
