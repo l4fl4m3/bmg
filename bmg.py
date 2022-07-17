@@ -31,6 +31,7 @@ class ActorCritic(nn.Module):
 
         pi = F.relu(self.pi1(x))
         v = F.relu(self.v1(x))
+
         pi = F.relu(self.pi2(pi))
         v = F.relu(self.v2(v))
 
@@ -102,12 +103,10 @@ class Agent:
         self.random_seed = random_seed
         self.gamma = gamma
         
-        self.env.set_seed(random_seed)
-
         #stats
         self.avg_reward = [0 for _ in range(10)]
         self.accum_reward = 0
-        self.cum_rewards = []
+        self.cum_reward = []
         self.entropy_rate = []
 
     def rollout(self, bootstrap=False):
@@ -121,24 +120,23 @@ class Agent:
             dist, v = self.actorcritic(obs)
 
             action = dist.sample()
-
-            obs_, reward, done, _ = self.env.step(action.numpy()[0])
-            self.accum_reward += reward
+            
+            obs_, reward, done, _ = self.env.step(action.cpu().numpy()[0])
 
             log_prob = dist.log_prob(action)
             entropy += -dist.entropy()
-        
+
             states.append(obs)
-            log_probs.append(log_prob.unsqueeze(0).to(self.actorcritic.device))
             values.append(v)
-            rewards.append(T.tensor(reward, dtype=T.float).to(self.actorcritic.device))
+            log_probs.append(log_prob.unsqueeze(0).to(self.actorcritic.device))
+            rewards.append(T.tensor([reward]).to(self.actorcritic.device))
 
             # non-episodic, (i.e use all rewards)
             #masks.append(T.tensor([1-int(done)], dtype=T.float).to(self.actorcritic.device))
             #rollout_reward += reward*(1-int(done))
             rollout_reward += reward
-
-            self.cum_rewards.append(self.accum_reward)
+            self.accum_reward += reward
+            self.cum_reward.append(self.accum_reward)
             
             obs = obs_
 
@@ -157,10 +155,8 @@ class Agent:
         for step in reversed(range(len(rewards))):
             #R = rewards[step] + self.gamma * R * masks[step]
             R = rewards[step] + self.gamma * R
-            discounted_returns.insert(0, R)
-
-        log_probs = T.cat(log_probs)
-        values    = T.cat(values)
+            discounted_returns.append(R)
+        discounted_returns.reverse()
 
         self.avg_reward = self.avg_reward[1:] 
         self.avg_reward.append(rollout_reward / self.rollout_steps)
@@ -168,14 +164,16 @@ class Agent:
         eps_en = self.meta_mlp(ar)
 
         entropy = entropy / self.rollout_steps
-        self.entropy_rate.append(float(eps_en)) 
+        self.entropy_rate.append(eps_en.item()) 
         
-        returns = T.cat(discounted_returns).detach()
+        log_probs = T.cat(log_probs)
+        values = T.cat(values)
+        returns = T.cat(discounted_returns)
         advantage = returns - values
 
         # Compute losses
-        actor_loss  = -(log_probs * advantage.detach()).mean()
-        critic_loss = 0.5 * advantage.pow(2).mean()
+        actor_loss = -T.mean((log_probs * advantage.detach()))
+        critic_loss = 0.5 * T.mean(advantage.pow(2))
 
         if bootstrap:
             return actor_loss, states
@@ -197,15 +195,15 @@ class Agent:
     def plot_results(self):
 
         cr = plt.figure(figsize=(10, 10)) 
-        plt.plot(self.cum_rewards)
+        plt.plot(self.cum_reward)
         plt.xlabel('Steps')
         plt.ylabel('Cumulative Reward')
         plt.savefig('res/cumulative_reward')
         plt.close(cr)
 
         er = plt.figure(figsize=(10, 10))
-        plt.plot(self.entropy_rate)
-        plt.xlabel('Steps')
+        plt.plot(list(range(1, 18_750 * 16 + 1, 16)), self.entropy_rate[-18_750:])
+        plt.xlabel('Steps (Last 300,000 of 4.8M steps)')
         plt.ylabel('Entropy Rate')
         plt.savefig('res/entropy_rate')
         plt.close(er)
@@ -214,7 +212,7 @@ class Agent:
 
         outer_range = self.steps // self.rollout_steps
         outer_range = outer_range // (self.K_steps + self.L_steps)
-
+        ct = 0
         for _ in range(outer_range):
             for _ in range(self.K_steps):
                 loss = self.rollout()
@@ -242,6 +240,15 @@ class Agent:
             TorchOpt.stop_gradient(self.actorcritic)
             TorchOpt.stop_gradient(self.actorcritic.optim)
 
+            ct += self.rollout_steps*((self.K_steps + self.L_steps))
+
+            # print stats
+            if ct %1000 == 0:
+                print(f"CR and ER, step# {ct}:")
+                print(self.cum_reward[-1])
+                print(self.entropy_rate[-1])
+                print("###")
+
     def save_models(self):
         self.actorcritic.save_checkpoint()
         self.meta_mlp.save_checkpoint()
@@ -252,7 +259,7 @@ class Agent:
 
 if __name__ == "__main__":
     '''Driver code'''
-    steps = 2000
+    steps = 4_800_000
     K_steps = 3
     L_steps = 5
     rollout_steps = 16
@@ -262,7 +269,7 @@ if __name__ == "__main__":
     input_dims = [env.observation_space.shape[0]]
     gamma = 0.99
     alpha = 0.1
-    m_alpha = 0.0001
+    m_alpha = 1e-4
     betas = (0.9, 0.999)
     eps = 1e-4
     name = 'meta_agent_bmg' 
